@@ -68,13 +68,19 @@
 #include <rte_ring.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
+#include "pkt_buff.h"
+#include <sys/time.h>
+#include <time.h>
+#include <assert.h>
 
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
 
 #define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
-#define NB_MBUF   8192
+//#define NB_MBUF   8192
+#define NB_MBUF   2048
 
-#define MAX_PKT_BURST 32
+//#define MAX_PKT_BURST 32
+#define MAX_PKT_BURST 2
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 
 /*
@@ -140,6 +146,11 @@ struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 static int64_t timer_period = 10 * TIMER_MILLISECOND * 1000; /* default period is 10 seconds */
 
+struct timeval startime;
+struct timeval endtime;
+int pktlen;
+uint64_t ts_count = 1, ts_total = 0;
+
 /* Print out statistics on packets dropped */
 static void
 print_stats(void)
@@ -156,6 +167,10 @@ print_stats(void)
 
 		/* Clear screen and move to top left */
 	printf("%s%s", clr, topLeft);
+
+        struct timeval subtime;
+        gettimeofday(&endtime, NULL);
+        timersub(&endtime, &startime, &subtime);
 
 	printf("\nPort statistics ====================================");
 
@@ -183,6 +198,17 @@ print_stats(void)
 		   total_packets_tx,
 		   total_packets_rx,
 		   total_packets_dropped);
+        printf("\nTX Speed = %5.2f Gbps, RX Speed = %5.2f Gbps, latency count "
+                "%ld, rte_get_timer_hz %ld, rte_get_tsc_hz %ld,  average %lf",
+                (double)(total_packets_tx * pktlen * 8) /
+                (double) ((subtime.tv_sec*1000000+subtime.tv_usec) * 1000),
+                (double)(total_packets_rx * pktlen * 8) /
+                (double) ((subtime.tv_sec*1000000+subtime.tv_usec) * 1000),
+                ts_count,
+                rte_get_timer_hz(),
+                rte_get_tsc_hz(),
+                (ts_total/ts_count) / (rte_get_tsc_hz() / 1e6));
+
 	printf("\n====================================================\n");
 }
 
@@ -193,23 +219,31 @@ l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 	struct rte_mbuf **m_table;
 	unsigned ret;
 	unsigned queueid =0;
+        unsigned i;
 
 	m_table = (struct rte_mbuf **)qconf->tx_mbufs[port].m_table;
+
+        /* attache time_stamp */
+        for (i = 0; i < n; i ++) {
+                uint64_t now = rte_rdtsc_precise();
+                *(uint64_t *)((char *)(rte_ctrlmbuf_data(m_table[i])) + 56) = now;
+        }
+
 
 	ret = rte_eth_tx_burst(port, (uint16_t) queueid, m_table, (uint16_t) n);
 	port_statistics[port].tx += ret;
 	if (unlikely(ret < n)) {
 		port_statistics[port].dropped += (n - ret);
-		do {
-			rte_pktmbuf_free(m_table[ret]);
-		} while (++ret < n);
+		//do {
+		//	rte_pktmbuf_free(m_table[ret]);
+		//} while (++ret < n);
 	}
 
 	return 0;
 }
 
 /* Enqueue packets for TX and prepare them to be sent */
-static int
+/*static int
 l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
 {
 	unsigned lcore_id, len;
@@ -221,9 +255,9 @@ l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
 	len = qconf->tx_mbufs[port].len;
 	qconf->tx_mbufs[port].m_table[len] = m;
 	len++;
-
+*/
 	/* enough pkts to be sent */
-	if (unlikely(len == MAX_PKT_BURST)) {
+/*	if (unlikely(len == MAX_PKT_BURST)) {
 		l2fwd_send_burst(qconf, MAX_PKT_BURST, port);
 		len = 0;
 	}
@@ -231,7 +265,8 @@ l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
 	qconf->tx_mbufs[port].len = len;
 	return 0;
 }
-
+*/
+/*
 static void
 l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 {
@@ -241,16 +276,31 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 
 	dst_port = l2fwd_dst_ports[portid];
 	eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
-
+*/
 	/* 02:00:00:00:00:xx */
-	tmp = &eth->d_addr.addr_bytes[0];
+/*	tmp = &eth->d_addr.addr_bytes[0];
 	*((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dst_port << 40);
-
+*/
 	/* src addr */
-	ether_addr_copy(&l2fwd_ports_eth_addr[dst_port], &eth->s_addr);
+/*	ether_addr_copy(&l2fwd_ports_eth_addr[dst_port], &eth->s_addr);
 
 	l2fwd_send_packet(m, (uint8_t) dst_port);
 }
+*/
+
+static void
+rx_process_pkt(struct rte_mbuf *m)
+{
+       uint64_t now = rte_rdtsc_precise();
+       uint64_t ts = *(uint64_t *)((char *)(rte_ctrlmbuf_data(m)) + 56);
+       if (ts != 0) {
+               ts_total += now - ts;
+               ts_count ++;
+       }
+       pktlen = rte_ctrlmbuf_len(m);
+}
+
+
 
 /* main processing loop */
 static void
@@ -260,9 +310,8 @@ l2fwd_main_loop(void)
 	struct rte_mbuf *m;
 	unsigned lcore_id;
 	uint64_t prev_tsc, diff_tsc, cur_tsc, timer_tsc;
-	unsigned i, j, portid, nb_rx;
+	unsigned i, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
-	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 
 	prev_tsc = 0;
 	timer_tsc = 0;
@@ -284,6 +333,33 @@ l2fwd_main_loop(void)
 			portid);
 	}
 
+        file_cache_t *fct;
+        unsigned int tmp_pktlen;
+        char *pktdata;
+        if ((fct = preload_pcap_file(0)) != NULL) {
+                printf("Loading done, core %d\n", lcore_id);
+                if (!check_pcap(fct))
+                        printf("It is not trace file, core %d\n", lcore_id);
+        } else {
+                printf("Loading failed, core %d\n", lcore_id);
+        }
+        pktdata = prep_next_skb(fct, &tmp_pktlen);
+
+        pktlen = tmp_pktlen;
+
+        for (i = 0; i < MAX_PKT_BURST; i ++) {
+                struct rte_mbuf *m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
+                assert (m != NULL);
+                m->nb_segs = 1;
+                m->next = NULL;
+                m->pkt_len = (uint16_t)pktlen;
+                m->data_len = (uint16_t)pktlen;
+                memcpy(rte_ctrlmbuf_data(m), pktdata, pktlen);
+                qconf->tx_mbufs[0].m_table[i] = m;
+        }
+        qconf->tx_mbufs[0].len = MAX_PKT_BURST;
+
+        gettimeofday(&startime, NULL);
 	while (1) {
 
 		cur_tsc = rte_rdtsc();
@@ -292,16 +368,20 @@ l2fwd_main_loop(void)
 		 * TX burst queue drain
 		 */
 		diff_tsc = cur_tsc - prev_tsc;
-		if (unlikely(diff_tsc > drain_tsc)) {
-
-			for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+		//if (unlikely(diff_tsc > drain_tsc)) {
+                {
+                      /*for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
 				if (qconf->tx_mbufs[portid].len == 0)
 					continue;
 				l2fwd_send_burst(&lcore_queue_conf[lcore_id],
 						 qconf->tx_mbufs[portid].len,
 						 (uint8_t) portid);
 				qconf->tx_mbufs[portid].len = 0;
-			}
+			}*/
+                       assert (qconf->tx_mbufs[0].len == MAX_PKT_BURST);
+                       l2fwd_send_burst(&lcore_queue_conf[lcore_id],
+                                        qconf->tx_mbufs[0].len,
+                                        (uint8_t) 0);
 
 			/* if timer is enabled */
 			if (timer_period > 0) {
@@ -322,14 +402,30 @@ l2fwd_main_loop(void)
 			}
 
 			prev_tsc = cur_tsc;
-		}
+		//}
 
 		/*
 		 * Read packet from RX queues
 		 */
-		for (i = 0; i < qconf->n_rx_port; i++) {
+		//for (i = 0; i < qconf->n_rx_port; i++) {
 
-			portid = qconf->rx_port_list[i];
+
+                       for (i = 0; i < qconf->n_rx_port; i++) {
+
+                               portid = qconf->rx_port_list[i];
+                               nb_rx = rte_eth_rx_burst((uint8_t) portid, 0,
+                                               pkts_burst, MAX_PKT_BURST * 2);
+
+                               port_statistics[portid].rx += nb_rx;
+
+                               if (nb_rx > 0) {
+                                       m = pkts_burst[0];
+                                       rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+                                       rx_process_pkt(m);
+                               }
+
+
+			/*portid = qconf->rx_port_list[i];
 			nb_rx = rte_eth_rx_burst((uint8_t) portid, 0,
 						 pkts_burst, MAX_PKT_BURST);
 
@@ -338,7 +434,13 @@ l2fwd_main_loop(void)
 			for (j = 0; j < nb_rx; j++) {
 				m = pkts_burst[j];
 				rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-				l2fwd_simple_forward(m, portid);
+				l2fwd_simple_forward(m, portid);*/
+                               if (nb_rx > 0) {
+                                       unsigned int k = 0;
+                                       do {
+                                               rte_pktmbuf_free(pkts_burst[k]);
+                                       } while (++k < nb_rx);
+                               }
 			}
 		}
 	}
